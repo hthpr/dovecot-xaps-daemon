@@ -27,22 +27,30 @@ package main
 import (
 	"bufio"
 	"crypto/x509"
-	"encoding/pem"
 	"errors"
 	"flag"
-	"github.com/st3fan/apns"
-	"io/ioutil"
+	"encoding/json"
+        "github.com/sideshow/apns2"
+	"github.com/sideshow/apns2/certificate"
 	"log"
 	"net"
 	"os"
 	"strings"
 )
 
-const Version = "1.0b1"
+const Version = "2.0"
 
 type command struct {
 	name string
 	args map[string]interface{}
+}
+
+type Payload struct {
+	Aps Aps `json:"aps"`
+}
+
+type Aps struct {
+	AccountID string `json:"account-id"`
 }
 
 func (cmd *command) getStringArg(name string) (string, bool) {
@@ -112,26 +120,9 @@ func parseCommand(line string) (command, error) {
 var debug = flag.Bool("debug", false, "enable debug logging")
 var socket = flag.String("socket", "/var/run/xapsd/xapsd.sock", "path to the socket for Dovecot")
 var database = flag.String("database", "/var/lib/xapsd/database.json", "path to the database file")
-var key = flag.String("key", "/etc/xapsd/key.pem", "path to the pem file containing the private key")
+var certfile = flag.String("certificate", "/etc/xapsd/certificate.pem", "path to the pem/p12 file containing the key and certificate")
 
-var certificate = flag.String("certificate", "/etc/xapsd/certificate.pem", "path to the pem file containing the certificate")
-
-func topicFromCertificate(filename string) (string, error) {
-	data, err := ioutil.ReadFile(filename)
-	if err != nil {
-		return "", err
-	}
-
-	block, _ := pem.Decode([]byte(data))
-	if block == nil {
-		return "", errors.New("Could not decode PEM block from certificate")
-	}
-
-	cert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return "", err
-	}
-
+func topicFromCertificate(cert *x509.Certificate) (string, error) {
 	if len(cert.Subject.Names) == 0 {
 		return "", errors.New("Subject.Names is empty")
 	}
@@ -142,6 +133,13 @@ func topicFromCertificate(filename string) (string, error) {
 	}
 
 	return cert.Subject.Names[0].Value.(string), nil
+}
+
+func SetAccountID(accountid string) []byte {
+        p := Payload{}
+        p.Aps.AccountID = accountid
+        aps, _ := json.Marshal(p)
+        return aps
 }
 
 func main() {
@@ -179,10 +177,19 @@ func main() {
 	}
 
 	if *debug {
-		log.Println("[DEBUG] Parsing", *certificate, "to obtain APNS Topic")
+		log.Println("[DEBUG] Parsing", *certfile, "to obtain APNS Topic")
 	}
 
-	topic, err := topicFromCertificate(*certificate)
+        cert, err := certificate.FromPemFile(*certfile, "")
+        if err != nil {
+		log.Println("PEM Certificate Loading Error: ", err)
+		cert, err = certificate.FromP12File(*certfile, "")
+		if err != nil { 
+			log.Fatal("P12 Certificate Loading Error: ", err)
+		}
+	}
+
+	topic, err := topicFromCertificate(cert.Leaf)
 	if err != nil {
 		log.Fatal("Could not parse apns topic from certificate: ", err.Error())
 	}
@@ -192,19 +199,10 @@ func main() {
 	}
 
 	if *debug {
-		log.Println("[DEBUG] Creating APNS client to", apns.ProductionGateway)
+		log.Println("[DEBUG] Creating APNS client to", apns2.HostProduction)
 	}
 
-	c, err := apns.NewClientWithFiles(apns.ProductionGateway, *certificate, *key)
-	if err != nil {
-		log.Fatal("Could not create client: ", err.Error())
-	}
-
-	go func() {
-		for f := range c.FailedNotifs {
-			log.Println("Notification", f.Notif.ID, "failed with", f.Err.Error())
-		}
-	}()
+	c := apns2.NewClient(cert).Production()
 
 	log.Printf("Starting xapsd %s on %s", Version, *socket)
 
@@ -219,11 +217,11 @@ func main() {
 			log.Println("[DEBUG] Accepted a connection")
 		}
 
-		go handleRequest(conn, &c, db, topic)
+		go handleRequest(conn, c, db, topic)
 	}
 }
 
-func handleRequest(conn net.Conn, client *apns.Client, db *Database, topic string) {
+func handleRequest(conn net.Conn, client *apns2.Client, db *Database, topic string) {
 	defer conn.Close()
 
 	scanner := bufio.NewScanner(conn)
@@ -265,7 +263,7 @@ func handleRequest(conn net.Conn, client *apns.Client, db *Database, topic strin
 // notifications.
 //
 
-func handleRegister(conn net.Conn, cmd command, client *apns.Client, db *Database, topic string) {
+func handleRegister(conn net.Conn, cmd command, client *apns2.Client, db *Database, topic string) {
 	// Make sure the subtopic is ok
 	subtopic, ok := cmd.getStringArg("aps-subtopic")
 	if !ok {
@@ -323,7 +321,7 @@ func handleRegister(conn net.Conn, cmd command, client *apns.Client, db *Databas
 //  { "aps": { "account-id": aps-account-id } }
 //
 
-func handleNotify(conn net.Conn, cmd command, client *apns.Client, db *Database) {
+func handleNotify(conn net.Conn, cmd command, client *apns2.Client, db *Database) {
 	// Make sure we got the required arguments
 	username, ok := cmd.getStringArg("dovecot-username")
 	if !ok {
@@ -355,13 +353,20 @@ func handleNotify(conn net.Conn, cmd command, client *apns.Client, db *Database)
 	writeSuccess(conn, "")
 }
 
-func sendNotification(reg Registration, client *apns.Client) {
-	payload := apns.NewPayload()
-	payload.APS.AccountId = reg.AccountId
-	notification := apns.NewNotification()
-	notification.Payload = payload
+func sendNotification(reg Registration, client *apns2.Client) {
+	notification := &apns2.Notification{}
+	notification.Payload = SetAccountID(reg.AccountId)
 	notification.DeviceToken = reg.DeviceToken
-	client.Send(notification)
+	res, err := client.Push(notification)
+
+	if err != nil {
+		if *debug {
+			log.Println("[DEBUG] Error: ", err)
+		}
+        }
+	if *debug {
+		log.Printf("[DEBUG] %v %v %v\n", res.StatusCode, res.ApnsID, res.Reason)
+        }
 }
 
 func writeError(conn net.Conn, msg string) {
