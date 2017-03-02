@@ -184,7 +184,7 @@ func main() {
 	}
 	defer db.conn.Close()
 
-	for name, sql := range db.queries {
+	for _, sql := range db.queries {
 		defer sql.Close()
         }
 
@@ -206,8 +206,7 @@ func main() {
 	defer listener.Close()
 	defer os.Remove(Config.Socket)
 
-	// TODO What is the proper way to limit Dovecot to this socket
-	if err := os.Chmod(Config.Socket, 0777); err != nil {
+	if err := os.Chmod(Config.Socket, 0666); err != nil {
 		log.Fatal("Could not chmod socket: ", err.Error())
 	}
 
@@ -256,7 +255,7 @@ func main() {
 		if err != nil {
 			select {
 			case <-quit:
-				log.Printf("Shutting Down xapsd %s", Version)
+				log.Printf("Shutting down xapsd %s", Version)
 				break Accept
 			default:
 				log.Println("Failed to accept connection: ", err.Error())
