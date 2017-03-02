@@ -25,105 +25,122 @@
 package main
 
 import (
-	"encoding/json"
-	"io/ioutil"
-	"os"
+	"strings"
+	"log"
+	"strconv"
+	"database/sql"
+	_ "github.com/go-sql-driver/mysql"
+	"fmt"
 )
 
 type Registration struct {
+	DbId        int
 	DeviceToken string
 	AccountId   string
 }
 
-type Account struct {
-	//AccountId     string
-	DeviceToken string
-	Mailboxes   []string
-}
-
-func (account *Account) ContainsMailbox(mailbox string) bool {
-	for _, m := range account.Mailboxes {
-		if m == mailbox {
-			return true
-		}
-	}
-	return false
-}
-
-type User struct {
-	//Username string
-	Accounts map[string]Account
-}
-
 type Database struct {
-	filename string
-	Users    map[string]User
+	conn     *sql.DB
+	queries map[string]*sql.Stmt
 }
 
-func newDatabase(filename string) (*Database, error) {
-	// TODO This is not awesome.
-	// Let's rewrite. Like replace this with Open(..., "rw") instead of ReadFile()
-	_, err := os.Stat(filename)
-	if os.IsNotExist(err) {
-		db := &Database{filename: filename, Users: make(map[string]User)}
-		if err := db.write(); err != nil {
-			return nil, err
-		}
-		return db, nil
-	} else if err != nil {
-		return nil, err
-	} else {
-		data, err := ioutil.ReadFile(filename)
-		if err != nil {
-			return nil, err
-		}
+func connectDatabase() (*Database, error) {
 
-		var db Database = Database{filename: filename, Users: make(map[string]User)}
-		if len(data) != 0 {
-			if err := json.Unmarshal(data, &db); err != nil {
-				return nil, err
-			}
-		}
-
-		return &db, nil
+	// Connect to Database
+	host := "@tcp(" + Config.DB.Host + ":" + strconv.FormatUint(uint64(Config.DB.Port), 10) + ")/"
+	if Config.DB.Socket != "" {
+		host = "@unix(" + Config.DB.Socket + ")/"
 	}
+
+	db_conn, err := sql.Open("mysql", Config.DB.User + ":" + Config.DB.Password + host + Config.DB.Name + "?" + Config.DB.Options)
+        if err != nil {
+		return nil, err
+	}
+
+        err = db_conn.Ping()
+        if err != nil {
+		return nil, err
+        }
+
+	var db Database = Database{conn: db_conn, queries: make(map[string]*sql.Stmt)}
+
+	// Prepare SQL Queries
+	for name, sql := range Config.DB.Queries {
+		db.queries[name], err = db.conn.Prepare(sql.Sql)
+		if err != nil {
+			return nil, fmt.Errorf("Unable to prepare query '%s': %v", name, err)
+		}
+	}
+
+	return &db, nil
 }
 
-func (db *Database) write() error {
-	data, err := json.MarshalIndent(db, "", "  ")
+func (db *Database) addRegistration(username, accountId, deviceToken string, mailboxes []string) error {
+
+	s := strings.Split(username, "@")
+	var mbxid int
+	query := db.queries
+
+	err := query["select_mbx_id"].QueryRow(s[0], s[1]).Scan(&mbxid)
+	if err != nil {
+		return err
+	}
+	if *debug {
+		log.Println("[DEBUG] Query Mailbox ID:", mbxid)
+	}
+
+	res, err := query["insert_aps"].Exec(mbxid, accountId, deviceToken)
 	if err != nil {
 		return err
 	}
 
-	return ioutil.WriteFile(db.filename, data, 0644)
-}
-
-func (db *Database) addRegistration(username, accountId, deviceToken string, mailboxes []string) error {
-	// Ensure the User exists
-	if _, ok := db.Users[username]; !ok {
-		db.Users[username] = User{Accounts: make(map[string]Account)}
+	mbxapsid, err := res.LastInsertId()
+	if *debug {
+		log.Println("[DEBUG] Last Insert ID:", mbxapsid)
 	}
 
-	// Ensure the Account exists
-	if _, ok := db.Users[username].Accounts[accountId]; !ok {
-		db.Users[username].Accounts[accountId] = Account{}
-	}
+	res, err = query["delete_aps_mailboxes"].Exec(mbxapsid)
+	if err != nil {
+		return err
+        }
 
-	// Set or update the Registration
-	db.Users[username].Accounts[accountId] = Account{DeviceToken: deviceToken, Mailboxes: mailboxes}
+        for _, m := range mailboxes {
+		 query["insert_aps_mailboxes"].Exec(mbxapsid, m)
+        }
 
-	return db.write()
+	return nil
 }
 
 func (db *Database) findRegistrations(username, mailbox string) ([]Registration, error) {
 	var registrations []Registration
-	if user, ok := db.Users[username]; ok {
-		for accountId, account := range user.Accounts {
-			if account.ContainsMailbox(mailbox) {
-				registrations = append(registrations,
-					Registration{DeviceToken: account.DeviceToken, AccountId: accountId})
-			}
+	s := strings.Split(username, "@")
+	rows, _ := db.queries["find_registration"].Query(mailbox, s[0], s[1])
+	defer rows.Close()
+
+	var (
+		dbid int
+		devicetoken string
+		accountId string
+	)
+
+	for rows.Next() {
+		_ = rows.Scan(&dbid, &accountId, &devicetoken)
+		registrations = append(registrations,
+			Registration{DbId: dbid, DeviceToken: devicetoken, AccountId: accountId})
+		if *debug {
+			log.Println("[DEBUG] Found Registration:", devicetoken, accountId)
 		}
 	}
+
 	return registrations, nil
+}
+
+func (db *Database) deleteRegistration(reg Registration) error {
+
+	_, err := db.queries["delete_registration"].Exec(reg.DbId)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
