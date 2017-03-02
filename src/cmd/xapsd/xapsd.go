@@ -32,9 +32,12 @@ import (
 	"encoding/json"
         "github.com/sideshow/apns2"
 	"github.com/sideshow/apns2/certificate"
+	"github.com/jinzhu/configor"
 	"log"
 	"net"
 	"os"
+	"os/signal"
+	"syscall"
 	"strings"
 )
 
@@ -118,9 +121,6 @@ func parseCommand(line string) (command, error) {
 }
 
 var debug = flag.Bool("debug", false, "enable debug logging")
-var socket = flag.String("socket", "/var/run/xapsd/xapsd.sock", "path to the socket for Dovecot")
-var database = flag.String("database", "/var/lib/xapsd/database.json", "path to the database file")
-var certfile = flag.String("certificate", "/etc/xapsd/certificate.pem", "path to the pem/p12 file containing the key and certificate")
 
 func topicFromCertificate(cert *x509.Certificate) (string, error) {
 	if len(cert.Subject.Names) == 0 {
@@ -142,48 +142,83 @@ func SetAccountID(accountid string) []byte {
         return aps
 }
 
+type SQLQueries struct {
+    Sql	string
+}
+
+var Config = struct {
+	Certificate string `default:"/etc/xapsd/certificate.pem"`
+	Socket      string `default:"/var/run/xapsd/xapsd.sock"`
+
+	DB struct {
+		Host	 string
+		Port	 uint16 `default:"3306"`
+		Socket	 string
+		Name	 string
+		User	 string `default:"root"`
+		Password string `required:"true"`
+		Options  string `default:"timeout=5s&collation=utf8mb4_unicode_ci"`
+		Queries map[string]SQLQueries
+	}
+}{}
+
 func main() {
+	config := flag.String("config", "/etc/xapsd.toml", "path to configuration file")
+	socket := flag.String("socket", "", "path to the socket for Dovecot")
+	certfile := flag.String("certificate", "", "path to the pem/p12 file containing the key and certificate")
 	flag.Parse()
 
-	if *debug {
-		log.Println("[DEBUG] Opening database at", *database)
+	configor.Load(&Config, *config)
+
+	if *certfile != "" {
+		Config.Certificate = *certfile
 	}
 
-	db, err := newDatabase(*database)
+        if *socket != "" {
+                Config.Socket = *socket
+        }
+
+	db, err := connectDatabase()
 	if err != nil {
-		log.Fatal("Cannot open database: ", *database, err.Error())
+		log.Fatal(err)
 	}
+	defer db.conn.Close()
 
-	// Delete the socket is it already exists
-	if _, err := os.Stat(*socket); err == nil {
-		if err := os.Remove(*socket); err != nil {
-			log.Fatal("Could not delete existing socket: ", *socket, err.Error())
+	for name, sql := range db.queries {
+		defer sql.Close()
+        }
+
+	// Delete the socket if it already exists
+	if _, err := os.Stat(Config.Socket); err == nil {
+		if err := os.Remove(Config.Socket); err != nil {
+			log.Fatal("Could not delete existing socket: ", Config.Socket, err.Error())
 		}
 	}
 
 	if *debug {
-		log.Println("[DEBUG] Listening on UNIX socket at", *socket)
+		log.Println("[DEBUG] Listening on UNIX socket at", Config.Socket)
 	}
 
-	listener, err := net.Listen("unix", *socket)
+	listener, err := net.Listen("unix", Config.Socket)
 	if err != nil {
 		log.Fatal("Could not create socket: ", err.Error())
 	}
-	defer os.Remove(*socket)
+	defer listener.Close()
+	defer os.Remove(Config.Socket)
 
 	// TODO What is the proper way to limit Dovecot to this socket
-	if err := os.Chmod(*socket, 0777); err != nil {
+	if err := os.Chmod(Config.Socket, 0777); err != nil {
 		log.Fatal("Could not chmod socket: ", err.Error())
 	}
 
 	if *debug {
-		log.Println("[DEBUG] Parsing", *certfile, "to obtain APNS Topic")
+		log.Println("[DEBUG] Parsing", Config.Certificate, "to obtain APNS Topic")
 	}
 
-        cert, err := certificate.FromPemFile(*certfile, "")
+        cert, err := certificate.FromPemFile(Config.Certificate, "")
         if err != nil {
 		log.Println("PEM Certificate Loading Error: ", err)
-		cert, err = certificate.FromP12File(*certfile, "")
+		cert, err = certificate.FromP12File(Config.Certificate, "")
 		if err != nil { 
 			log.Fatal("P12 Certificate Loading Error: ", err)
 		}
@@ -204,13 +239,30 @@ func main() {
 
 	c := apns2.NewClient(cert).Production()
 
-	log.Printf("Starting xapsd %s on %s", Version, *socket)
+	signalChannel := make(chan os.Signal, 2)
+	quit := make(chan bool)
+	signal.Notify(signalChannel, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-signalChannel
+		close(quit)
+		listener.Close()
+	}()
 
+	log.Printf("Starting xapsd %s on %s", Version, Config.Socket)
+
+	Accept:
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			log.Println("Failed to accept connection: ", err.Error())
-			os.Exit(1)
+			select {
+			case <-quit:
+				log.Printf("Shutting Down xapsd %s", Version)
+				break Accept
+			default:
+				log.Println("Failed to accept connection: ", err.Error())
+				os.Exit(1)
+			}
+			continue
 		}
 
 		if *debug {
@@ -218,6 +270,8 @@ func main() {
 		}
 
 		go handleRequest(conn, c, db, topic)
+
+
 	}
 }
 
@@ -232,7 +286,7 @@ func handleRequest(conn net.Conn, client *apns2.Client, db *Database, topic stri
 
 		command, err := parseCommand(scanner.Text())
 		if err != nil {
-			log.Println("Reading froms socket: ", err)
+			log.Println("Reading from socket: ", err)
 		}
 
 		switch command.name {
@@ -246,7 +300,7 @@ func handleRequest(conn net.Conn, client *apns2.Client, db *Database, topic stri
 	}
 
 	if err := scanner.Err(); err != nil {
-		log.Println("Reading froms socket: ", err)
+		log.Println("Reading from socket: ", err)
 	}
 }
 
@@ -342,31 +396,39 @@ func handleNotify(conn net.Conn, cmd command, client *apns2.Client, db *Database
 	}
 
 	// Send a notification to all registered devices. We ignore failures
-	// because there is not a lot we can do.
+	// because there is not a lot we can do. We do delete registrations
+	// if Apple servers respond with 410 error.
 	for _, registration := range registrations {
 		if *debug {
 			log.Println("[DEBUG] Sending notification to", registration.AccountId, "/", registration.DeviceToken)
 		}
-		sendNotification(registration, client)
+		res := sendNotification(registration, client)
+		if res.StatusCode == 410 {
+			if *debug {
+				log.Printf("[DEBUG] Device %v (DB: %v) is no longer registered. APN-Status: %v (%v)\n", registration.AccountId, registration.DbId, res.StatusCode, res.Reason)
+			}
+			db.deleteRegistration(registration)
+		}
 	}
 
 	writeSuccess(conn, "")
 }
 
-func sendNotification(reg Registration, client *apns2.Client) {
+func sendNotification(reg Registration, client *apns2.Client) (*apns2.Response) {
 	notification := &apns2.Notification{}
 	notification.Payload = SetAccountID(reg.AccountId)
 	notification.DeviceToken = reg.DeviceToken
 	res, err := client.Push(notification)
 
 	if err != nil {
-		if *debug {
-			log.Println("[DEBUG] Error: ", err)
-		}
+		log.Println("Sending Notification failed: ", err)
+		return nil
         }
+
 	if *debug {
 		log.Printf("[DEBUG] %v %v %v\n", res.StatusCode, res.ApnsID, res.Reason)
         }
+	return res
 }
 
 func writeError(conn net.Conn, msg string) {
