@@ -39,6 +39,7 @@ import (
 	"os/signal"
 	"syscall"
 	"strings"
+	"fmt"
 )
 
 const Version = "2.0"
@@ -165,8 +166,14 @@ var Config = struct {
 func main() {
 	config := flag.String("config", "/etc/xapsd.toml", "path to configuration file")
 	socket := flag.String("socket", "", "path to the socket for Dovecot")
+	printsocket := flag.Bool("printsocket", false, "only print current socket file and exit")
 	certfile := flag.String("certificate", "", "path to the pem/p12 file containing the key and certificate")
 	flag.Parse()
+
+	_, err := os.Stat(*config)
+	if err != nil {
+		log.Fatal("Config file does not exist ", *config)
+	}
 
 	configor.Load(&Config, *config)
 
@@ -177,6 +184,11 @@ func main() {
         if *socket != "" {
                 Config.Socket = *socket
         }
+
+	if *printsocket {
+		fmt.Println(Config.Socket)
+		os.Exit(0)
+	}
 
 	db, err := connectDatabase()
 	if err != nil {
