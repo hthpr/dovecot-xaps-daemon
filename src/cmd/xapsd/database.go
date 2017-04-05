@@ -31,6 +31,7 @@ import (
 	"database/sql"
 	_ "github.com/go-sql-driver/mysql"
 	"fmt"
+	"time"
 )
 
 type Registration struct {
@@ -61,6 +62,16 @@ func connectDatabase() (*Database, error) {
         if err != nil {
 		return nil, err
         }
+
+	// Set database connection settings
+	timeout, err := time.ParseDuration(Config.DB.ConnectionMaxLifeTime)
+	if err != nil {
+		timeout = 0
+	}
+	db_conn.SetConnMaxLifetime(timeout)
+	db_conn.SetMaxOpenConns(Config.DB.MaxOpenConnections)
+	db_conn.SetMaxIdleConns(Config.DB.MaxIdleConnections)
+
 
 	var db Database = Database{conn: db_conn, queries: make(map[string]*sql.Stmt)}
 

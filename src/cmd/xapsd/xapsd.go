@@ -42,7 +42,7 @@ import (
 	"fmt"
 )
 
-const Version = "2.1.0"
+const Version = "2.2.0"
 
 type command struct {
 	name string
@@ -160,6 +160,9 @@ var Config = struct {
 		Password string `required:"true"`
 		Options  string `default:"timeout=5s&collation=utf8mb4_unicode_ci"`
 		Queries map[string]SQLQueries
+		ConnectionMaxLifeTime	string	`default:"0"`
+		MaxIdleConnections	int	`default:"2"`
+		MaxOpenConnections	int	`default:"5"`
 	}
 }{}
 
