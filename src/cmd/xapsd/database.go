@@ -124,7 +124,13 @@ func (db *Database) addRegistration(username, accountId, deviceToken string, mai
 func (db *Database) findRegistrations(username, mailbox string) ([]Registration, error) {
 	var registrations []Registration
 	s := strings.Split(username, "@")
-	rows, _ := db.queries["find_registration"].Query(mailbox, s[0], s[1])
+	rows, err := db.queries["find_registration"].Query(mailbox, s[0], s[1])
+	if err != nil {
+		if err == sql.ErrNoRows {
+			err = nil
+		}
+		return registrations, err
+	}
 	defer rows.Close()
 
 	var (
