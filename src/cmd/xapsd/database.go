@@ -81,7 +81,13 @@ func (db *Database) addRegistration(username, accountId, deviceToken string, mai
 	var mbxid int
 	query := db.queries
 
-	err := query["select_mbx_id"].QueryRow(s[0], s[1]).Scan(&mbxid)
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	err = tx.Stmt(query["select_mbx_id"]).QueryRow(s[0], s[1]).Scan(&mbxid)
 	if err != nil {
 		return err
 	}
@@ -89,7 +95,7 @@ func (db *Database) addRegistration(username, accountId, deviceToken string, mai
 		log.Println("[DEBUG] Query Mailbox ID:", mbxid)
 	}
 
-	res, err := query["insert_aps"].Exec(mbxid, accountId, deviceToken)
+	res, err := tx.Stmt(query["insert_aps"]).Exec(mbxid, accountId, deviceToken)
 	if err != nil {
 		return err
 	}
@@ -99,14 +105,18 @@ func (db *Database) addRegistration(username, accountId, deviceToken string, mai
 		log.Println("[DEBUG] Last Insert ID:", mbxapsid)
 	}
 
-	res, err = query["delete_aps_mailboxes"].Exec(mbxapsid)
+	res, err = tx.Stmt(query["delete_aps_mailboxes"]).Exec(mbxapsid)
 	if err != nil {
 		return err
         }
 
         for _, m := range mailboxes {
-		 query["insert_aps_mailboxes"].Exec(mbxapsid, m)
+		 tx.Stmt(query["insert_aps_mailboxes"]).Exec(mbxapsid, m)
         }
+	err = tx.Commit()
+	if err != nil {
+		return err
+	}
 
 	return nil
 }
