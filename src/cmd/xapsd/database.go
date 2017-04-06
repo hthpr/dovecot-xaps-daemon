@@ -45,6 +45,16 @@ type Database struct {
 	queries map[string]*sql.Stmt
 }
 
+type addMailboxes struct {
+	id		int64
+	action	uint8
+}
+
+const (
+	MBX_INSERT = 1
+	MBX_DELETE = 2
+)
+
 func connectDatabase() (*Database, error) {
 
 	// Connect to Database
@@ -86,47 +96,103 @@ func connectDatabase() (*Database, error) {
 	return &db, nil
 }
 
-func (db *Database) addRegistration(username, accountId, deviceToken string, mailboxes []string) error {
-
-	s := strings.Split(username, "@")
-	var mbxid int
-	query := db.queries
-
+func (db *Database) addMailboxes(mailboxes map[string]*addMailboxes) error {
+	
+	if *debug {
+		log.Println("[DEBUG] Modifying Mailboxes: ", len(mailboxes))
+	}
+	
 	tx, err := db.conn.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	
+	for mbx_name, mbx_struct := range mailboxes {
+		switch mbx_struct.action {
+		case MBX_INSERT:
+			tx.Stmt(db.queries["insert_aps_mailbox"]).Exec(mbx_struct.id, mbx_name)
+		case MBX_DELETE:
+			tx.Stmt(db.queries["delete_aps_mailbox"]).Exec(mbx_struct.id)
+		}
+	}
 
-	err = tx.Stmt(query["select_mbx_id"]).QueryRow(s[0], s[1]).Scan(&mbxid)
+	err = tx.Commit()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (db *Database) addRegistration(username, accountId, deviceToken string, mailboxes []string) error {
+
+	s := strings.Split(username, "@")
+	var (
+		mbxid uint32
+		apsid int64
+		aps_mbxid int64
+		aps_mbx_name string
+	)
+	query := db.queries
+
+	// Get mailbox id
+	err := query["select_mbx_id"].QueryRow(s[0], s[1]).Scan(&mbxid)
 	if err != nil {
 		return err
 	}
 	if *debug {
 		log.Println("[DEBUG] Query Mailbox ID:", mbxid)
 	}
-
-	res, err := tx.Stmt(query["insert_aps"]).Exec(mbxid, accountId, deviceToken)
-	if err != nil {
+	
+	// Get or insert account into aps table
+	err = query["select_aps_settings_id"].QueryRow(mbxid, accountId, deviceToken).Scan(&apsid)
+	switch {
+	case err == sql.ErrNoRows:
+		res, err := query["insert_aps"].Exec(mbxid, accountId, deviceToken)
+		if err != nil {
+			return err
+		}
+		apsid, err = res.LastInsertId()
+		if *debug {
+			log.Println("[DEBUG] Registered Account: ", mbxid, apsid)
+		}
+	case err != nil:
 		return err
 	}
-
-	mbxapsid, err := res.LastInsertId()
-	if *debug {
-		log.Println("[DEBUG] Last Insert ID:", mbxapsid)
+	
+	// Add mailboxes to a map
+	map_mailboxes := make(map[string]*addMailboxes, 4)
+	for _, m := range mailboxes {
+		map_mailboxes[m] = &addMailboxes{apsid, MBX_INSERT}
 	}
 
-	res, err = tx.Stmt(query["delete_aps_mailboxes"]).Exec(mbxapsid)
+	// Figure out which mailboxes need to be added/removed
+	rows, err := query["get_aps_mailboxes"].Query(apsid)
 	if err != nil {
+		if err == sql.ErrNoRows {
+			err = db.addMailboxes(map_mailboxes)
+		}
 		return err
-        }
-
-        for _, m := range mailboxes {
-		 tx.Stmt(query["insert_aps_mailboxes"]).Exec(mbxapsid, m)
-        }
-	err = tx.Commit()
-	if err != nil {
-		return err
+	}
+	defer rows.Close()
+	
+	for rows.Next() {
+		_ = rows.Scan(&aps_mbxid, &aps_mbx_name)
+		if _, ok := map_mailboxes[aps_mbx_name]; ok {
+			delete(map_mailboxes, aps_mbx_name)
+		} else {
+			map_mailboxes[aps_mbx_name] = &addMailboxes{aps_mbxid, MBX_DELETE}
+		}
+	}
+	rows.Close()
+	
+	// Add mailboxes if required
+	if len(map_mailboxes) > 0 {
+		err = db.addMailboxes(map_mailboxes)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil

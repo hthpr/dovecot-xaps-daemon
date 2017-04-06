@@ -42,7 +42,7 @@ import (
 	"fmt"
 )
 
-const Version = "2.2.0"
+const Version = "2.3.0"
 
 type command struct {
 	name string
