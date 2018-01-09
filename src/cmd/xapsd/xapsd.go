@@ -43,7 +43,7 @@ import (
 	"time"
 )
 
-const Version = "2.3.2"
+const Version = "2.4.0"
 
 type command struct {
 	name string
@@ -433,8 +433,7 @@ func sendNotification(reg Registration, client *apns2.Client) (*apns2.Response) 
 	notification := &apns2.Notification{}
 	notification.Payload = SetAccountID(reg.AccountId)
 	notification.DeviceToken = reg.DeviceToken
-	t := time.Now().Add(24 * time.Hour)
-	notification.Expiration = &t
+	notification.Expiration = time.Now().Add(24 * time.Hour)
 	res, err := client.Push(notification)
 
 	if err != nil {
