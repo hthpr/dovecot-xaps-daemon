@@ -432,6 +432,8 @@ func sendNotification(reg Registration, client *apns2.Client) (*apns2.Response) 
 	notification := &apns2.Notification{}
 	notification.Payload = SetAccountID(reg.AccountId)
 	notification.DeviceToken = reg.DeviceToken
+	t := time.Now().Add(24 * time.Hour)
+	notification.Expiration = &t
 	res, err := client.Push(notification)
 
 	if err != nil {
