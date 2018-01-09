@@ -40,9 +40,10 @@ import (
 	"syscall"
 	"strings"
 	"fmt"
+	"time"
 )
 
-const Version = "2.3.0"
+const Version = "2.3.2"
 
 type command struct {
 	name string
